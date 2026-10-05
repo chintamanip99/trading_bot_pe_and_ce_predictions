@@ -1,12 +1,15 @@
 """
-4-MODEL ENSEMBLE PAPER TRADING BOT  (NO THRESHOLDS)
+4-MODEL ENSEMBLE PAPER TRADING BOT  (HOLD-AWARE CNN v2)
 Starting Balance: ₹1,00,000
 Fixed 4% Target / 4% SL
 
-RULE:
-  If pattern matches BULL → BUY CE immediately
-  If pattern matches BEAR → BUY PE immediately
-  No confidence gates, no lead gates, no ensemble thresholds.
+CNN RULE (fixed):
+  1. Compute probs [P(hold), P(buy), P(sell)]
+  2. If P(hold) is the largest class AND >= CNN_HOLD_DOMINANCE → HOLD
+  3. Else pick max(P(buy), P(sell)) only if the winner
+     beats the loser by >= CNN_MIN_BUY_SELL_EDGE
+  4. Otherwise → HOLD
+  5. predicted_class is ALWAYS synced with the actual signal
 """
 
 import numpy as np
@@ -33,17 +36,20 @@ warnings.filterwarnings('ignore')
 # CONFIG
 # ============================================================
 LOT_SIZE = 10
-INITIAL_BALANCE = 100000        # ₹1,00,000
+INITIAL_BALANCE = 100000
 
-TARGET_PCT = 0.04               # +4%
-SL_PCT     = 0.04               # -4%
+TARGET_PCT = 0.02
+SL_PCT     = 0.04
 
-MAX_HOLD_TIME = 20              # minutes
-CAPITAL_UTILIZATION = 1.0
+MAX_HOLD_TIME = 20
+CAPITAL_UTILIZATION = 0.95
 
-# ---- CNN_IGNORE_HOLD: CNN always picks Buy vs Sell, never Hold ----
+# ---- CNN Hold-aware gating ----
 CNN_IGNORE_HOLD = True
-CNN_IGNORE_HOLD_MIN_MARGIN = 0.0   # 0 = no margin required, just argmax of probs[1] vs probs[2]
+# If P(hold) is the top class AND >= this, force HOLD
+CNN_HOLD_DOMINANCE = 0.35          # lowered — 40% Hold should trigger HOLD
+# Winner of Buy vs Sell must beat loser by at least this
+CNN_MIN_BUY_SELL_EDGE = 0.15       # 15% absolute gap required
 
 LSTM_LOOKBACK = 30
 CNN_LOOKBACK  = 10
@@ -51,9 +57,9 @@ CNN_LOOKBACK  = 10
 LSTM_FEATURES = ['Open', 'High', 'Low', 'Close', 'Volume', 'OI']
 CNN_FEATURES  = LSTM_FEATURES.copy()
 
-UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWJhMTFmOWQ4MGE3OTc3MmY4NWMzZDIiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzkwNTc5MTkzLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3OTA2MzI4MDB9.0ZX_KioQPLHW3xRTiD_4MyP27tOplMJYxdBaiWjW02s"
-INSTRUMENT_TOKEN_CE = "MCX_FO|580785"
-INSTRUMENT_TOKEN_PE = "MCX_FO|580936"
+UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIzMjc3NTkiLCJqdGkiOiI2YWMzMmVkOTE2ZDkzYzNkZWJkYWI5MTEiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzkxMTc2NDA5LCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3OTEyMzc2MDB9.fjpYSTukzFYUXdVLO93l1-5HXRylGJqB2iTTcJOGqdM"
+INSTRUMENT_TOKEN_CE = "NSE_FO|51330"
+INSTRUMENT_TOKEN_PE = "NSE_FO|51331"
 
 nest_asyncio.apply()
 
@@ -92,11 +98,13 @@ model_predictions = {
     'lstm':    {'signal': 0, 'confidence': 0.0, 'prediction': 0.0,
                 'close_diff_predicted': 0.0},
     'cnn':     {'signal': 0, 'confidence': 0.0, 'class_prob': 0.0,
-                'predicted_class': 0, 'lead': 0.0, 'probs': [0.0, 0.0, 0.0]},
+                'predicted_class': 0, 'lead': 0.0, 'probs': [0.0, 0.0, 0.0],
+                'forced_hold': False, 'hold_dominance': 0.0},
     'lstm_pe': {'signal': 0, 'confidence': 0.0, 'prediction': 0.0,
                 'close_diff_predicted': 0.0},
     'cnn_pe':  {'signal': 0, 'confidence': 0.0, 'class_prob': 0.0,
-                'predicted_class': 0, 'lead': 0.0, 'probs': [0.0, 0.0, 0.0]}
+                'predicted_class': 0, 'lead': 0.0, 'probs': [0.0, 0.0, 0.0],
+                'forced_hold': False, 'hold_dominance': 0.0}
 }
 
 last_consensus_debug = {}
@@ -146,16 +154,18 @@ def load_all_models():
     try:
         lstm_model = load_model("lstm_fixed.h5", compile=False)
         loaded['lstm'] = True
-        print(f"✅ LSTM(CE) shape={lstm_model.input_shape}")
+        print(f"✅ LSTM(CE) loaded  shape={lstm_model.input_shape}")
     except Exception as e:
         print(f"❌ LSTM(CE): {e}")
+        lstm_model = None
 
     try:
         cnn_model = load_model("cnn_fixed.h5", compile=False)
         loaded['cnn'] = True
-        print(f"✅ CNN(CE) shape={cnn_model.input_shape}")
+        print(f"✅ CNN(CE) loaded  shape={cnn_model.input_shape}")
     except Exception as e:
         print(f"❌ CNN(CE): {e}")
+        cnn_model = None
 
     try:
         lstm_scaler = joblib.load("scaler_X.pkl")
@@ -163,26 +173,31 @@ def load_all_models():
         print(f"✅ LSTM(CE) scalers loaded")
     except Exception as e:
         print(f"❌ LSTM(CE) scalers: {e}")
+        lstm_scaler = None
+        target_scaler = None
 
     try:
         cnn_scaler = joblib.load("cnn_feature_scaler.pkl")
         print(f"✅ CNN(CE) scaler loaded")
     except Exception as e:
         print(f"❌ CNN(CE) scaler: {e}")
+        cnn_scaler = None
 
     try:
         lstm_model_pe = load_model("lstm_fixed_pe.h5", compile=False)
         loaded['lstm_pe'] = True
-        print(f"✅ LSTM(PE) shape={lstm_model_pe.input_shape}")
+        print(f"✅ LSTM(PE) loaded  shape={lstm_model_pe.input_shape}")
     except Exception as e:
         print(f"❌ LSTM(PE): {e}")
+        lstm_model_pe = None
 
     try:
         cnn_model_pe = load_model("cnn_fixed_pe.h5", compile=False)
         loaded['cnn_pe'] = True
-        print(f"✅ CNN(PE) shape={cnn_model_pe.input_shape}")
+        print(f"✅ CNN(PE) loaded  shape={cnn_model_pe.input_shape}")
     except Exception as e:
         print(f"❌ CNN(PE): {e}")
+        cnn_model_pe = None
 
     try:
         lstm_scaler_pe = joblib.load("scaler_X_pe.pkl")
@@ -234,7 +249,7 @@ def fetch_historical_ohlcv(instrument_key, days=10):
 
 
 # ============================================================
-# LSTM PREDICT  (signal = sign of close_diff)
+# LSTM
 # ============================================================
 def _predict_lstm_core(df_raw, scaler_X, scaler_y, model):
     if model is None or scaler_X is None or scaler_y is None:
@@ -274,7 +289,6 @@ def predict_lstm_ce(df_raw):
     latest_lstm_predicted_price = res['pred_price']
     latest_close_diff_predicted = cd
 
-    # SIMPLE: signal = sign of close_diff
     if cd > 0:
         sig = 1
     elif cd < 0:
@@ -284,7 +298,7 @@ def predict_lstm_ce(df_raw):
 
     model_predictions['lstm'] = {
         'signal': sig,
-        'confidence': abs(cd),  # just for display
+        'confidence': abs(cd),
         'prediction': res['pred_price'],
         'close_diff_predicted': cd,
     }
@@ -317,7 +331,7 @@ def predict_lstm_pe(df_raw):
 
 
 # ============================================================
-# CNN PREDICT  (IGNORE HOLD → always 1 or 2)
+# CNN  —  HOLD-AWARE v2 (predicted_class synced with signal)
 # ============================================================
 def _predict_cnn_core(df_raw, scaler, model):
     if model is None or scaler is None:
@@ -360,18 +374,63 @@ def _predict_cnn_core(df_raw, scaler, model):
     if probs.size < 3:
         probs = np.pad(probs, (0, 3 - probs.size), constant_values=0.0)
 
-    # IGNORE HOLD: always pick Buy or Sell
+    p_hold = float(probs[0])
     p_buy  = float(probs[1])
     p_sell = float(probs[2])
-    if p_buy >= p_sell:
-        sig = 1; pc = 1; cp = p_buy
+
+    # ---- Classify which class is largest ----
+    argmax_class = int(np.argmax(probs))
+
+    forced_hold = False
+
+    if not CNN_IGNORE_HOLD:
+        # Standard 3-class argmax
+        sig = argmax_class
+        pc = argmax_class
+        cp = float(probs[pc])
+        lead = float(np.sort(probs)[::-1][0] - np.sort(probs)[::-1][1])
     else:
-        sig = 2; pc = 2; cp = p_sell
+        # --- Rule 1: Hold is top class AND above dominance → HOLD ---
+        if argmax_class == 0 and p_hold >= CNN_HOLD_DOMINANCE:
+            sig = 0
+            pc = 0
+            cp = p_hold
+            lead = p_hold - max(p_buy, p_sell)
+            forced_hold = True
+        else:
+            # --- Rule 2: pick winner of Buy vs Sell, but require edge ---
+            if p_buy >= p_sell:
+                win_p, lose_p = p_buy, p_sell
+                cand_sig, cand_pc = 1, 1
+            else:
+                win_p, lose_p = p_sell, p_buy
+                cand_sig, cand_pc = 2, 2
 
-    lead = abs(p_buy - p_sell)
+            edge = win_p - lose_p
+            if edge >= CNN_MIN_BUY_SELL_EDGE:
+                sig = cand_sig
+                pc = cand_pc          # ← SYNC: predicted_class = signal
+                cp = win_p
+                lead = edge
+            else:
+                # Too close → HOLD
+                sig = 0
+                pc = 0                # ← SYNC: predicted_class = 0 = Hold
+                cp = p_hold
+                lead = abs(p_buy - p_sell)
+                forced_hold = True
 
-    return {'probs': probs.tolist(), 'predicted_class': pc,
-            'class_prob': cp, 'lead': lead, 'signal': sig, 'confidence': cp}
+    return {
+        'probs': probs.tolist(),
+        'predicted_class': pc,        # always 0/1/2 matching signal
+        'class_prob': cp,
+        'lead': lead,
+        'signal': sig,                # always 0/1/2
+        'confidence': cp,
+        'forced_hold': forced_hold,
+        'hold_dominance': p_hold,
+        'argmax_class': argmax_class, # raw argmax (for diagnostics)
+    }
 
 
 def predict_cnn_ce(df_raw):
@@ -380,7 +439,9 @@ def predict_cnn_ce(df_raw):
     if res is None:
         return
     model_predictions['cnn'] = res
-    diag(f"CNN(CE) sig={res['signal']} probs=[{res['probs'][0]:.3f},{res['probs'][1]:.3f},{res['probs'][2]:.3f}]")
+    fh = " [FORCED HOLD]" if res.get('forced_hold') else ""
+    diag(f"CNN(CE) sig={res['signal']} argmax={res['argmax_class']}{fh} "
+         f"probs=[H:{res['probs'][0]:.2f} B:{res['probs'][1]:.2f} S:{res['probs'][2]:.2f}]")
 
 
 def predict_cnn_pe(df_raw):
@@ -389,11 +450,13 @@ def predict_cnn_pe(df_raw):
     if res is None:
         return
     model_predictions['cnn_pe'] = res
-    diag(f"CNN(PE) sig={res['signal']} probs=[{res['probs'][0]:.3f},{res['probs'][1]:.3f},{res['probs'][2]:.3f}]")
+    fh = " [FORCED HOLD]" if res.get('forced_hold') else ""
+    diag(f"CNN(PE) sig={res['signal']} argmax={res['argmax_class']}{fh} "
+         f"probs=[H:{res['probs'][0]:.2f} B:{res['probs'][1]:.2f} S:{res['probs'][2]:.2f}]")
 
 
 # ============================================================
-# CONSENSUS  —  NO THRESHOLDS
+# CONSENSUS
 # ============================================================
 def ensemble_signal_generation():
     global last_consensus_debug
@@ -486,7 +549,7 @@ def update_status(ce_p, pe_p, sig, conf, ms):
 
 
 # ============================================================
-# PAPER BOT  —  NO THRESHOLDS
+# PAPER BOT
 # ============================================================
 class PaperTradingBot:
     def __init__(self, balance=INITIAL_BALANCE, lot_size=LOT_SIZE):
@@ -511,7 +574,7 @@ class PaperTradingBot:
         self.largest_win = 0
         self.largest_loss = 0
         self.consecutive_losses = 0
-        self.max_consecutive_losses = 99999  # effectively disabled
+        self.max_consecutive_losses = 99999
         self.brokerage_fixed = 5
         self.gst_rate = 0.18
         self.stt_sell = 0.0001
@@ -604,7 +667,6 @@ class PaperTradingBot:
         if sig not in (1, 2):
             return
 
-        # ONLY blocks that remain (these are NOT threshold/confidence gates):
         if self.position is not None:
             diag("SKIP: already in position"); return
         if not self.can_place_order():
@@ -796,9 +858,40 @@ def health():
             'lstm': lstm_model is not None, 'cnn': cnn_model is not None,
             'lstm_pe': lstm_model_pe is not None, 'cnn_pe': cnn_model_pe is not None,
         },
+        'cnn_config': {
+            'CNN_IGNORE_HOLD': CNN_IGNORE_HOLD,
+            'CNN_HOLD_DOMINANCE': CNN_HOLD_DOMINANCE,
+            'CNN_MIN_BUY_SELL_EDGE': CNN_MIN_BUY_SELL_EDGE,
+        },
         'ce_buffer': len(ce_ohlcv_buffer),
         'pe_buffer': len(pe_ohlcv_buffer),
     }), 200
+
+
+@app.route('/update', methods=['POST', 'GET'])
+@cross_origin()
+def update_models():
+    global g_current_status
+    try:
+        print("\n" + "=" * 70)
+        print("🔄 /update — reloading all models + scalers")
+        print("=" * 70)
+        loaded = load_all_models()
+        success = [k for k, v in loaded.items() if v]
+        failed  = [k for k, v in loaded.items() if not v]
+        g_current_status = f"Models reloaded ({len(success)}/4 OK)"
+        diag(f"🔄 /update — reloaded: {success} | failed: {failed}")
+        return jsonify({
+            'message': 'Models reloaded',
+            'models_loaded': loaded,
+            'success': success,
+            'failed': failed,
+            'all_ok': len(failed) == 0,
+            'timestamp': datetime.datetime.now().isoformat(),
+        }), 200
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/diag_log', methods=['GET'])
@@ -808,6 +901,11 @@ def get_diag_log():
         'diag_log': diag_log,
         'last_consensus_debug': last_consensus_debug,
         'current_predictions': model_predictions,
+        'cnn_config': {
+            'CNN_IGNORE_HOLD': CNN_IGNORE_HOLD,
+            'CNN_HOLD_DOMINANCE': CNN_HOLD_DOMINANCE,
+            'CNN_MIN_BUY_SELL_EDGE': CNN_MIN_BUY_SELL_EDGE,
+        },
         'timestamp': datetime.datetime.now().isoformat(),
     }), 200
 
@@ -840,6 +938,12 @@ def current_pattern():
         'is_bear': is_bear,
         'matched': is_bull or is_bear,
         'position': paper_trading_bot.position,
+        'signals_detail': {
+            'lstm':    model_predictions['lstm'],
+            'cnn':     model_predictions['cnn'],
+            'lstm_pe': model_predictions['lstm_pe'],
+            'cnn_pe':  model_predictions['cnn_pe'],
+        },
         'timestamp': datetime.datetime.now().isoformat(),
     }), 200
 
@@ -910,6 +1014,10 @@ def status():
                 'confidence': float(model_predictions['cnn']['confidence']),
                 'lead': float(model_predictions['cnn'].get('lead', 0.0)),
                 'probs': model_predictions['cnn'].get('probs', [0,0,0]),
+                'predicted_class': int(model_predictions['cnn'].get('predicted_class', 0)),
+                'forced_hold': bool(model_predictions['cnn'].get('forced_hold', False)),
+                'hold_dominance': float(model_predictions['cnn'].get('hold_dominance', 0.0)),
+                'argmax_class': int(model_predictions['cnn'].get('argmax_class', 0)),
             },
             'lstm_pe': {
                 'signal': int(model_predictions['lstm_pe']['signal']),
@@ -924,6 +1032,10 @@ def status():
                 'confidence': float(model_predictions['cnn_pe']['confidence']),
                 'lead': float(model_predictions['cnn_pe'].get('lead', 0.0)),
                 'probs': model_predictions['cnn_pe'].get('probs', [0,0,0]),
+                'predicted_class': int(model_predictions['cnn_pe'].get('predicted_class', 0)),
+                'forced_hold': bool(model_predictions['cnn_pe'].get('forced_hold', False)),
+                'hold_dominance': float(model_predictions['cnn_pe'].get('hold_dominance', 0.0)),
+                'argmax_class': int(model_predictions['cnn_pe'].get('argmax_class', 0)),
             },
         },
         'four_model_pattern': f"{p[0]},{p[1]},{p[2]},{p[3]}",
@@ -975,10 +1087,14 @@ def reset():
 # ============================================================
 if __name__ == '__main__':
     print("=" * 80)
-    print("4-MODEL ENSEMBLE  —  NO THRESHOLDS")
+    print("4-MODEL ENSEMBLE  —  HOLD-AWARE CNN v2")
     print(f"💰 STARTING BALANCE = ₹{INITIAL_BALANCE:,}")
     print("=" * 80)
-    print("RULE: pattern match → trade IMMEDIATELY (no gates)")
+    print("CNN RULE:")
+    print(f"  1. If Hold is top class AND Hold >= {CNN_HOLD_DOMINANCE} → HOLD")
+    print(f"  2. Else pick max(Buy, Sell) IF edge >= {CNN_MIN_BUY_SELL_EDGE}")
+    print(f"  3. Else → HOLD")
+    print(f"  predicted_class is ALWAYS synced with signal")
     print("BULL: (1,1,2,2) OR (1,0,2,2) OR (0,1,2,2) OR (1,1,0,2) OR (1,1,2,0)")
     print("BEAR: (2,2,1,1) OR (2,0,1,1) OR (0,2,1,1) OR (2,2,0,1) OR (2,2,1,0)")
     print(f"TARGET = +{TARGET_PCT*100:.2f}%   SL = -{SL_PCT*100:.2f}%")
@@ -1029,6 +1145,7 @@ if __name__ == '__main__':
     print(f"\n💰 Starting Balance = ₹{INITIAL_BALANCE:,}")
     print(f"📌 TARGET = +{TARGET_PCT*100:.2f}%  |  SL = -{SL_PCT*100:.2f}%\n")
     print("Endpoints:")
+    print("   POST /update          — reload all models + scalers from disk")
     print("   GET  /status          — full state")
     print("   GET  /current_pattern — 4-signal tuple + match")
     print("   GET  /diag_log        — rolling log")
@@ -1042,4 +1159,4 @@ if __name__ == '__main__':
         print("\n🛑 Shutdown")
         stats = paper_trading_bot.get_performance_stats()
         print(f"💰 Final Balance: ₹{stats['current_balance']:,.2f}  "
-              f"Return: {stats['return_percentage']:+.2f}%")
+              f"Return: {stats['return_percentage']:+.2f}%")#19% max reacxhed
